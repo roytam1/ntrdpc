@@ -1,0 +1,14 @@
+# What the builds make (makefile, test/Makefile)
+*.obj
+*.res
+*.rbj
+*.exe
+test/headless
+test/replay
+test/nlatest
+test/sectest
+test/bearssl.a
+test/br/
+test/*.dSYM/
+# The ready exes are in the releases
+out/

@@ -1,0 +1,30 @@
+/*
+ * ntrdpc.rc - the icon and the connect dialog.
+ */
+
+#include <windows.h>
+#include "resource.h"
+
+IDI_NTRDPC ICON "ntrdpc.ico"
+
+IDD_CONNECT DIALOG 0, 0, 200, 144
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "ntrdpc"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT           "", IDC_MESSAGE, 8, 6, 184, 16
+    LTEXT           "&Computer:", -1, 8, 28, 40, 8
+    EDITTEXT        IDC_HOST, 52, 26, 140, 12, ES_AUTOHSCROLL
+    LTEXT           "&User:", -1, 8, 44, 40, 8
+    EDITTEXT        IDC_USER, 52, 42, 140, 12, ES_AUTOHSCROLL
+    LTEXT           "&Password:", -1, 8, 60, 40, 8
+    EDITTEXT        IDC_PASS, 52, 58, 140, 12, ES_AUTOHSCROLL | ES_PASSWORD
+    LTEXT           "&Domain:", -1, 8, 76, 40, 8
+    EDITTEXT        IDC_DOMAIN, 52, 74, 140, 12, ES_AUTOHSCROLL
+    LTEXT           "C&olors:", -1, 8, 92, 40, 8
+    COMBOBOX        IDC_COLORS, 52, 90, 70, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "&Resolution:", -1, 8, 108, 42, 8
+    COMBOBOX        IDC_RES, 52, 106, 70, 110, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "Connect", IDOK, 86, 124, 50, 14, WS_GROUP
+    PUSHBUTTON      "Cancel", IDCANCEL, 142, 124, 50, 14
+END
