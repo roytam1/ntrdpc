@@ -1362,6 +1362,19 @@ session_start(void)
 	DWORD n;
 	int cx = GetSystemMetrics(SM_CXSCREEN);
 	int cy = GetSystemMetrics(SM_CYSCREEN);
+	int use_full = cfg.full;
+	int w = cfg.width, h = cfg.height;
+
+	/* Some servers reject desktops below 640 x 480. Full screen would
+	 * ask for this (too small) screen size, so use a window with
+	 * scrollbars and request 640 x 480 instead. */
+	if (cx < 640 || cy < 480) {
+		use_full = 0;
+		if (!w)
+			w = 640;
+		if (!h)
+			h = 480;
+	}
 
 	strncpy(hostname, cfg.host, sizeof(hostname) - 1);
 	port = 3389;
@@ -1380,9 +1393,8 @@ session_start(void)
 	if (!GetComputerName(name, &n))
 		strcpy(name, "NTRDPC");
 	strncpy(o.client, name, sizeof(o.client) - 1);
-	o.width = cfg.width ? cfg.width : cfg.full ? cx : cx < 800 ? cx : 800;
-	o.height = cfg.height ? cfg.height : cfg.full ? cy :
-		   cy < 600 ? cy : 600;
+	o.width = w ? w : use_full ? cx : cx < 800 ? cx : 800;
+	o.height = h ? h : use_full ? cy : cy < 600 ? cy : 600;
 	o.width &= ~3;
 	o.bpp = cfg.bpp;
 	o.compress = 1;
@@ -1402,7 +1414,7 @@ session_start(void)
 	layout();
 	ShowWindow(hwnd, showcmd);
 	showcmd = SW_SHOW;
-	if (cfg.full)
+	if (use_full)
 		fullscreen(1);
 	InvalidateRect(hwnd, NULL, FALSE);
 	UpdateWindow(hwnd);
