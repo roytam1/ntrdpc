@@ -46,9 +46,14 @@ static RDP *rdp;
 static SOCKET sock = INVALID_SOCKET;
 static int connected;			/* the TCP connection is up */
 static int plain;			/* this server takes plain RDP only */
-static u8 rbuf[65536];
+/* Win32s thunks Winsock down to 16-bit Win16, whose recv/send take a 16-bit
+ * int length. 65536 truncates to 0, so recv() would return 0 ("server closed
+ * the connection") without reading anything. Keep buffers under 32767. */
+#define NETCHUNK 32767
+static u8 rbuf[NETCHUNK];
 static u8 *sendq;
 static long sendlen, sendcap;
+static int win32s;			/* running on Win32s, not NT */
 
 /* the picture */
 static BITMAPINFO *bmi;
@@ -275,6 +280,10 @@ make_store(void)
 				idx[i] = (WORD)i;
 		}
 	}
+	/* Win32s' GDI mis-converts an 8bpp DIB into a 16-color compatible
+	 * bitmap: the result is stripes/noise. Draw to the screen directly. */
+	if (win32s)
+		return;
 	dc = GetDC(hwnd);
 	memdc = CreateCompatibleDC(dc);
 	if (memdc)
@@ -1098,7 +1107,16 @@ wheel(int delta)
 
 /*
  * The socket.
+ * Win32s' 16-bit Winsock thunk reports "try again" in several ways: 0 or
+ * SOCKET_ERROR with WSAEWOULDBLOCK, WSAEINPROGRESS or WSAEALREADY. Real NT
+ * only uses SOCKET_ERROR/WSAEWOULDBLOCK. All mean "not now", not a failure.
  */
+static int
+net_transient(int err)
+{
+	return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS ||
+	       err == WSAEALREADY;
+}
 
 void
 ui_send(RDP *r, const u8 *d, int n)
@@ -1109,9 +1127,9 @@ ui_send(RDP *r, const u8 *d, int n)
 	if (sock == INVALID_SOCKET)
 		return;
 	while (sendlen == 0 && n > 0) {
-		k = send(sock, (char *)d, n, 0);
+		k = send(sock, (char *)d, n > NETCHUNK ? NETCHUNK : n, 0);
 		if (k == SOCKET_ERROR) {
-			if (WSAGetLastError() == WSAEWOULDBLOCK)
+			if (net_transient(WSAGetLastError()))
 				break;
 			rdp_fail(r, "The connection broke.");
 			return;
@@ -1145,9 +1163,11 @@ flush_send(void)
 	int k;
 
 	while (done < sendlen) {
-		k = send(sock, (char *)sendq + done, (int)(sendlen - done), 0);
+		long rem = sendlen - done;
+		k = send(sock, (char *)sendq + done,
+			 rem > NETCHUNK ? NETCHUNK : (int)rem, 0);
 		if (k == SOCKET_ERROR) {
-			if (WSAGetLastError() != WSAEWOULDBLOCK)
+			if (!net_transient(WSAGetLastError()))
 				rdp_fail(rdp, "The connection broke.");
 			break;
 		}
@@ -1212,8 +1232,16 @@ on_read(void)
 			total += n;
 			continue;
 		}
-		if (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
+		/* On NT 0 is a real close (the error may be stale). Win32s
+		 * reports "no data" as 0 with WSAEWOULDBLOCK, so trust the
+		 * error code there. */
+		if (n == 0 && !win32s) {
 			rdp_closed(rdp);
+			break;
+		}
+		if (net_transient(WSAGetLastError()))
+			break;
+		rdp_closed(rdp);
 		break;
 	}
 }
@@ -1226,7 +1254,8 @@ on_close(void)
 	while (rdp->state != RS_DONE &&
 	       (n = recv(sock, (char *)rbuf, sizeof(rbuf), 0)) > 0)
 		rdp_recv(rdp, rbuf, n);
-	if (rdp->state != RS_DONE)
+	if (rdp->state != RS_DONE &&
+	    ((n == 0 && !win32s) || !net_transient(WSAGetLastError())))
 		rdp_closed(rdp);
 }
 
@@ -1278,11 +1307,24 @@ net_poll(void)
 			FD_SET(sock, &wr);
 	}
 	tv.tv_sec = 0;
-	tv.tv_usec = 0;
-	if (select(0, &rd, &wr, &ex, &tv) <= 0)
-		return;
+	/* A zero timeout keeps Win32s' 16-bit Winsock from ever calling its
+	 * blocking hook, so the network stack never runs and the connect (and
+	 * everything after it) hangs. A decent non-zero timeout lets select()
+	 * pump the hook repeatedly; harmless on NT. */
+	tv.tv_usec = 1000;
+	/* On Win32s the 16-bit thunk misses readiness after the first packet,
+	 * so skip select() and let recv()/send() below say "not now" instead.
+	 * NT still uses select() as the fallback for lost socket messages. */
+	if (!win32s)
+		select(0, &rd, &wr, &ex, &tv);
 	if (!connected) {
-		if (FD_ISSET(sock, &ex)) {
+		if (win32s) {
+			err = 0;
+			len = sizeof(err);
+			getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err,
+				   &len);
+			on_connect(err ? err : 0);
+		} else if (FD_ISSET(sock, &ex)) {
 			err = 0;
 			len = sizeof(err);
 			getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err,
@@ -1291,9 +1333,9 @@ net_poll(void)
 		} else if (FD_ISSET(sock, &wr))
 			on_connect(0);
 	} else {
-		if (FD_ISSET(sock, &wr))
+		if (sendlen)
 			flush_send();
-		if (FD_ISSET(sock, &rd) && rdp->state != RS_DONE)
+		if (rdp->state != RS_DONE)
 			on_read();
 	}
 	paint_now();
@@ -1378,9 +1420,24 @@ session_start(void)
 	}
 	connected = 0;
 	sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (sock == INVALID_SOCKET ||
-	    WSAAsyncSelect(sock, hwnd, WM_SOCKET, FD_CONNECT | FD_READ |
-			   FD_WRITE | FD_CLOSE) == SOCKET_ERROR) {
+	if (sock == INVALID_SOCKET) {
+		sprintf(buf, "Windows Sockets error %d.", WSAGetLastError());
+		rdp_fail(rdp, buf);
+		return;
+	}
+	if (win32s) {
+		/* The Win32s 16-bit Winsock thunk's WSAAsyncSelect delivers
+		 * readiness unreliably. net_poll() does all the polling, so
+		 * just put the socket in non-blocking mode with FIONBIO. */
+		u_long one = 1;
+		if (ioctlsocket(sock, FIONBIO, &one) == SOCKET_ERROR) {
+			sprintf(buf, "Windows Sockets error %d.",
+				WSAGetLastError());
+			rdp_fail(rdp, buf);
+			return;
+		}
+	} else if (WSAAsyncSelect(sock, hwnd, WM_SOCKET, FD_CONNECT | FD_READ |
+				   FD_WRITE | FD_CLOSE) == SOCKET_ERROR) {
 		sprintf(buf, "Windows Sockets error %d.", WSAGetLastError());
 		rdp_fail(rdp, buf);
 		return;
@@ -1390,10 +1447,17 @@ session_start(void)
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons((u_short)port);
 	sa.sin_addr.s_addr = a;
-	if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) ==
-	    SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
-		connect_error(buf, WSAGetLastError());
-		rdp_fail(rdp, buf);
+	if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) {
+		if (!net_transient(WSAGetLastError())) {
+			connect_error(buf, WSAGetLastError());
+			rdp_fail(rdp, buf);
+		}
+	} else {
+		/* Some Winsock 1.1 stacks (notably the Win32s thunk) complete
+		 * connect() at once and may not send a reliable FD_CONNECT.
+		 * Start the session here; a later FD_CONNECT is ignored by
+		 * on_connect() because "connected" is already set. */
+		on_connect(0);
 	}
 }
 
@@ -1593,9 +1657,12 @@ WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmdline, int show)
 	MSG msg;
 	HMENU m;
 	HDC dc;
+	DWORD dwWinVer;
 	int r;
 
 	(void)prev;
+	dwWinVer = GetVersion();
+    win32s = (dwWinVer >= 0x80000000) && ((dwWinVer & 0xFF) == 3);
 	hinst = hi;
 	showcmd = show;
 	cfg_defaults(&cfg);
