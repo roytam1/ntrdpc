@@ -300,10 +300,15 @@ init_sizes(HWND d, const CONFIG *c)
 		sprintf(buf, "%d x %d", c->width, c->height);
 		SendDlgItemMessage(d, IDC_RES, CB_ADDSTRING, 0, (LPARAM)buf);
 		sel = NSIZES + 1;
-	} else if (sel < 0)	/* not chosen yet: 800 x 600, or full screen
-				   on a smaller screen */
-		sel = GetSystemMetrics(SM_CXSCREEN) < 800 ||
-		      GetSystemMetrics(SM_CYSCREEN) < 600 ? 0 : 2;
+	} else if (sel < 0) {
+		int cx = GetSystemMetrics(SM_CXSCREEN);
+		int cy = GetSystemMetrics(SM_CYSCREEN);
+		/* Some servers reject a desktop smaller than 640 x 480.
+		 * Full screen here would ask for the small screen size, so
+		 * pick 640 x 480 instead. */
+		sel = cx < 640 || cy < 480 ? 1 :
+		      cx < 800 || cy < 600 ? 0 : 2;
+	}
 	SendDlgItemMessage(d, IDC_RES, CB_SETCURSEL, sel, 0);
 }
 

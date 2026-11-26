@@ -46,9 +46,14 @@ static RDP *rdp;
 static SOCKET sock = INVALID_SOCKET;
 static int connected;			/* the TCP connection is up */
 static int plain;			/* this server takes plain RDP only */
-static u8 rbuf[65536];
+/* Win32s thunks Winsock down to 16-bit Win16, whose recv/send take a 16-bit
+ * int length. 65536 truncates to 0, so recv() would return 0 ("server closed
+ * the connection") without reading anything. Keep chunks at most 32767. */
+#define NETCHUNK 32767
+static u8 rbuf[NETCHUNK];
 static u8 *sendq;
 static long sendlen, sendcap;
+static int win32s;			/* running on Win32s, not NT */
 
 /* the picture */
 static BITMAPINFO *bmi;
@@ -179,7 +184,7 @@ make_lut(void)
 	long v, d, best;
 
 	lutbpp = 0;
-	if (!paldev || bpp == 8)
+	if (bpp == 8 || (!paldev && !win32s))
 		return;
 	if (!lut)
 		lut = (u8 *)malloc(65536L);
@@ -225,6 +230,28 @@ all_stale(void)
 	isstale = 1;
 }
 
+/* Win32s has no palette device: use an RGB color table instead of the
+ * palette indices the NT path puts in bmi8. */
+static void
+make_bmi8_rgb(void)
+{
+	RGBQUAD *q = (RGBQUAD *)bmi8->bmiColors;
+	int i;
+
+	for (i = 0; i < 216; i++) {
+		q[i].rgbRed = (BYTE)(i / 36 * 51);
+		q[i].rgbGreen = (BYTE)(i / 6 % 6 * 51);
+		q[i].rgbBlue = (BYTE)(i % 6 * 51);
+		q[i].rgbReserved = 0;
+	}
+	for (; i < 224; i++) {
+		q[i].rgbRed = win[i - 216][0];
+		q[i].rgbGreen = win[i - 216][1];
+		q[i].rgbBlue = win[i - 216][2];
+		q[i].rgbReserved = 0;
+	}
+}
+
 static void
 free_store(void)
 {
@@ -258,6 +285,31 @@ make_store(void)
 	int i;
 
 	free_store();
+	if (win32s) {
+		/* GDI mis-converts an 8bpp DIB into a 16-color compatible
+		 * bitmap, so there is no memory DC here. For a high-color
+		 * desktop, make the 8bpp band that paint() draws directly,
+		 * with an RGB color table (no palette device on Win32s). */
+		if (lutbpp) {
+			band = (u8 *)malloc((size_t)((f->w + 3) & ~3) *
+					    BANDROWS);
+			if (!bmi8)
+				bmi8 = (BITMAPINFO *)malloc(
+					sizeof(BITMAPINFOHEADER) +
+					256 * sizeof(RGBQUAD));
+			if (bmi8) {
+				memset(bmi8, 0, sizeof(BITMAPINFOHEADER));
+				bmi8->bmiHeader.biSize =
+					sizeof(BITMAPINFOHEADER);
+				bmi8->bmiHeader.biPlanes = 1;
+				bmi8->bmiHeader.biBitCount = 8;
+				bmi8->bmiHeader.biCompression = BI_RGB;
+				bmi8->bmiHeader.biClrUsed = 224;
+				make_bmi8_rgb();
+			}
+		}
+		return;
+	}
 	if (lutbpp) {
 		band = (u8 *)malloc((size_t)((f->w + 3) & ~3) * BANDROWS);
 		if (!bmi8)
@@ -294,9 +346,9 @@ make_store(void)
 	all_stale();
 }
 
-/* copies a desktop box from the frame buffer into memdc */
+/* copies a desktop box from the frame buffer into dc at dx, dy */
 static void
-refresh(BOX bx)
+refresh_to(HDC dc, BOX bx, int dx, int dy)
 {
 	FBUF *f = &rdp->fb;
 	const unsigned short *s16;
@@ -316,9 +368,9 @@ refresh(BOX bx)
 	if (w <= 0 || bx.b <= bx.t)
 		return;
 	if (!lutbpp || lutbpp != f->bpp || !band || !bmi8) {
-		/* GDI converts, memory to memory; the rows go bottom-up */
-		SetDIBitsToDevice(memdc, bx.l, bx.t, w, bx.b - bx.t, bx.l,
-				  f->h - bx.b, 0, f->h, f->bits, bmi,
+		/* GDI converts; the rows go bottom-up */
+		SetDIBitsToDevice(dc, bx.l + dx, bx.t + dy, w, bx.b - bx.t,
+				  bx.l, f->h - bx.b, 0, f->h, f->bits, bmi,
 				  DIB_RGB_COLORS);
 		return;
 	}
@@ -341,9 +393,16 @@ refresh(BOX bx)
 		}
 		bmi8->bmiHeader.biHeight = n;
 		bmi8->bmiHeader.biSizeImage = (DWORD)s8 * n;
-		SetDIBitsToDevice(memdc, bx.l, y0, w, n, 0, 0, 0, n, band,
-				  bmi8, DIB_PAL_COLORS);
+		SetDIBitsToDevice(dc, bx.l + dx, y0 + dy, w, n, 0, 0, 0, n,
+				  band, bmi8,
+				  win32s ? DIB_RGB_COLORS : DIB_PAL_COLORS);
 	}
+}
+
+static void
+refresh(BOX bx)
+{
+	refresh_to(memdc, bx, 0, 0);
 }
 
 /* the DIB header for the frame buffer */
@@ -528,12 +587,14 @@ paint(HDC dc, const RECT *r)
 			if (w > 0 && h > 0)
 				BitBlt(dc, x, y, w, h, memdc, x - d.left,
 				       y - d.top, SRCCOPY);
-		} else if (w > 0 && h > 0)
-			/* rows go bottom-up: the source y counts from the
-			   bottom */
-			SetDIBitsToDevice(dc, x, y, w, h, x - d.left,
-					  f->h - (y - d.top) - h, 0, f->h,
-					  f->bits, bmi, DIB_RGB_COLORS);
+		} else if (w > 0 && h > 0) {
+			BOX bx;
+			bx.l = x - d.left;
+			bx.t = y - d.top;
+			bx.r = bx.l + w;
+			bx.b = bx.t + h;
+			refresh_to(dc, bx, d.left, d.top);
+		}
 		if (old)
 			SelectPalette(dc, old, FALSE);
 		ExcludeClipRect(dc, d.left, d.top, d.right, d.bottom);
@@ -1098,7 +1159,16 @@ wheel(int delta)
 
 /*
  * The socket.
+ * Win32s' 16-bit Winsock thunk reports "try again" in several ways: 0 or
+ * SOCKET_ERROR with WSAEWOULDBLOCK, WSAEINPROGRESS or WSAEALREADY. Real NT
+ * only uses SOCKET_ERROR/WSAEWOULDBLOCK. All mean "not now", not a failure.
  */
+static int
+net_transient(int err)
+{
+	return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS ||
+	       err == WSAEALREADY;
+}
 
 void
 ui_send(RDP *r, const u8 *d, int n)
@@ -1109,12 +1179,15 @@ ui_send(RDP *r, const u8 *d, int n)
 	if (sock == INVALID_SOCKET)
 		return;
 	while (sendlen == 0 && n > 0) {
-		k = send(sock, (char *)d, n, 0);
-		if (k == SOCKET_ERROR) {
-			if (WSAGetLastError() == WSAEWOULDBLOCK)
-				break;
-			rdp_fail(r, "The connection broke.");
-			return;
+		k = send(sock, (char *)d, n > NETCHUNK ? NETCHUNK : n, 0);
+		if (k <= 0) {
+			/* Win32s may report "not now" as 0. Never loop on it. */
+			if (k == SOCKET_ERROR &&
+			    !net_transient(WSAGetLastError())) {
+				rdp_fail(r, "The connection broke.");
+				return;
+			}
+			break;			/* the rest goes into sendq */
 		}
 		d += k;
 		n -= k;
@@ -1145,11 +1218,14 @@ flush_send(void)
 	int k;
 
 	while (done < sendlen) {
-		k = send(sock, (char *)sendq + done, (int)(sendlen - done), 0);
-		if (k == SOCKET_ERROR) {
-			if (WSAGetLastError() != WSAEWOULDBLOCK)
+		long rem = sendlen - done;
+		k = send(sock, (char *)sendq + done,
+			 rem > NETCHUNK ? NETCHUNK : (int)rem, 0);
+		if (k <= 0) {
+			if (k == SOCKET_ERROR &&
+			    !net_transient(WSAGetLastError()))
 				rdp_fail(rdp, "The connection broke.");
-			break;
+			break;			/* retry on the next poll */
 		}
 		done += k;
 	}
@@ -1206,14 +1282,19 @@ on_read(void)
 	int n;
 
 	while (rdp->state != RS_DONE && total < 262144L) {
+		/* Winsock does not clear the last error on success: a stale
+		 * "would block" would hide a real close. Win32s reports "no
+		 * data" as 0 with a transient error, NT as SOCKET_ERROR. */
+		WSASetLastError(0);
 		n = recv(sock, (char *)rbuf, sizeof(rbuf), 0);
 		if (n > 0) {
 			rdp_recv(rdp, rbuf, n);
 			total += n;
 			continue;
 		}
-		if (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
-			rdp_closed(rdp);
+		if (net_transient(WSAGetLastError()))
+			break;
+		rdp_closed(rdp);
 		break;
 	}
 }
@@ -1223,10 +1304,14 @@ on_close(void)
 {
 	int n;
 
-	while (rdp->state != RS_DONE &&
-	       (n = recv(sock, (char *)rbuf, sizeof(rbuf), 0)) > 0)
+	while (rdp->state != RS_DONE) {
+		WSASetLastError(0);
+		n = recv(sock, (char *)rbuf, sizeof(rbuf), 0);
+		if (n <= 0)
+			break;
 		rdp_recv(rdp, rbuf, n);
-	if (rdp->state != RS_DONE)
+	}
+	if (rdp->state != RS_DONE && !net_transient(WSAGetLastError()))
 		rdp_closed(rdp);
 }
 
@@ -1266,6 +1351,30 @@ net_poll(void)
 
 	if (sock == INVALID_SOCKET || !rdp || rdp->state == RS_DONE)
 		return;
+	if (win32s) {
+		/* The 16-bit Winsock thunk misses readiness after the first
+		 * packet. Poll recv()/send() directly; they say "not now"
+		 * when nothing waits. */
+		if (!connected) {
+			struct sockaddr peer;
+			int plen = sizeof(peer);
+			err = 0;
+			len = sizeof(err);
+			getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err,
+				   &len);
+			if (err)
+				on_connect(err);
+			else if (getpeername(sock, &peer, &plen) == 0)
+				on_connect(0);
+		} else {
+			if (sendlen)
+				flush_send();
+			if (rdp->state != RS_DONE)
+				on_read();
+		}
+		paint_now();
+		return;
+	}
 	FD_ZERO(&rd);
 	FD_ZERO(&wr);
 	FD_ZERO(&ex);
@@ -1320,6 +1429,19 @@ session_start(void)
 	DWORD n;
 	int cx = GetSystemMetrics(SM_CXSCREEN);
 	int cy = GetSystemMetrics(SM_CYSCREEN);
+	int use_full = cfg.full;
+	int w = cfg.width, h = cfg.height;
+
+	/* Some servers reject desktops below 640 x 480. Full screen would
+	 * ask for this (too small) screen size, so use a window with
+	 * scrollbars and request 640 x 480 instead. */
+	if (cx < 640 || cy < 480) {
+		use_full = 0;
+		if (!w)
+			w = 640;
+		if (!h)
+			h = 480;
+	}
 
 	strncpy(hostname, cfg.host, sizeof(hostname) - 1);
 	port = 3389;
@@ -1338,9 +1460,8 @@ session_start(void)
 	if (!GetComputerName(name, &n))
 		strcpy(name, "NTRDPC");
 	strncpy(o.client, name, sizeof(o.client) - 1);
-	o.width = cfg.width ? cfg.width : cfg.full ? cx : cx < 800 ? cx : 800;
-	o.height = cfg.height ? cfg.height : cfg.full ? cy :
-		   cy < 600 ? cy : 600;
+	o.width = w ? w : use_full ? cx : cx < 800 ? cx : 800;
+	o.height = h ? h : use_full ? cy : cy < 600 ? cy : 600;
 	o.width &= ~3;
 	o.bpp = cfg.bpp;
 	o.compress = 1;
@@ -1360,7 +1481,7 @@ session_start(void)
 	layout();
 	ShowWindow(hwnd, showcmd);
 	showcmd = SW_SHOW;
-	if (cfg.full)
+	if (use_full)
 		fullscreen(1);
 	InvalidateRect(hwnd, NULL, FALSE);
 	UpdateWindow(hwnd);
@@ -1378,9 +1499,24 @@ session_start(void)
 	}
 	connected = 0;
 	sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (sock == INVALID_SOCKET ||
-	    WSAAsyncSelect(sock, hwnd, WM_SOCKET, FD_CONNECT | FD_READ |
-			   FD_WRITE | FD_CLOSE) == SOCKET_ERROR) {
+	if (sock == INVALID_SOCKET) {
+		sprintf(buf, "Windows Sockets error %d.", WSAGetLastError());
+		rdp_fail(rdp, buf);
+		return;
+	}
+	if (win32s) {
+		/* The Win32s 16-bit Winsock thunk's WSAAsyncSelect delivers
+		 * readiness unreliably. net_poll() does all the polling, so
+		 * just put the socket in non-blocking mode with FIONBIO. */
+		u_long one = 1;
+		if (ioctlsocket(sock, FIONBIO, &one) == SOCKET_ERROR) {
+			sprintf(buf, "Windows Sockets error %d.",
+				WSAGetLastError());
+			rdp_fail(rdp, buf);
+			return;
+		}
+	} else if (WSAAsyncSelect(sock, hwnd, WM_SOCKET, FD_CONNECT | FD_READ |
+				   FD_WRITE | FD_CLOSE) == SOCKET_ERROR) {
 		sprintf(buf, "Windows Sockets error %d.", WSAGetLastError());
 		rdp_fail(rdp, buf);
 		return;
@@ -1390,10 +1526,17 @@ session_start(void)
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons((u_short)port);
 	sa.sin_addr.s_addr = a;
-	if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) ==
-	    SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
-		connect_error(buf, WSAGetLastError());
-		rdp_fail(rdp, buf);
+	if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) {
+		if (!net_transient(WSAGetLastError())) {
+			connect_error(buf, WSAGetLastError());
+			rdp_fail(rdp, buf);
+		}
+	} else {
+		/* Some Winsock 1.1 stacks (notably the Win32s thunk) complete
+		 * connect() at once and may not send a reliable FD_CONNECT.
+		 * Start the session here; a later FD_CONNECT is ignored by
+		 * on_connect() because "connected" is already set. */
+		on_connect(0);
 	}
 }
 
@@ -1593,9 +1736,12 @@ WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmdline, int show)
 	MSG msg;
 	HMENU m;
 	HDC dc;
+	DWORD v;
 	int r;
 
 	(void)prev;
+	v = GetVersion();
+	win32s = (v & 0x80000000) != 0 && LOBYTE(LOWORD(v)) == 3;
 	hinst = hi;
 	showcmd = show;
 	cfg_defaults(&cfg);
